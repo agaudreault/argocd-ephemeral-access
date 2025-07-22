@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/argoproj-labs/argocd-ephemeral-access/internal/controller/metrics"
 
@@ -70,6 +71,71 @@ func (s *Service) getRenderedRole(ctx context.Context, ar *api.AccessRequest, pr
 	return rt, nil
 }
 
+// ValidateProject validates that the Argo CD Application is associated with a valid project
+// and that the AccessRequest matches the current project. It updates the AccessRequest status
+// to invalid in the following cases:
+// - The Application project isn't set.
+// - The Application project changed.
+// - The Application project does not exist.
+//
+// Returns true if the project is valid and exists, false otherwise. Returns an error if any
+// status update or project retrieval fails.
+func (s *Service) ValidateProject(ctx context.Context, app *argocd.Application, ar *api.AccessRequest) (bool, error) {
+	logger := log.FromContext(ctx)
+
+	// The Argo CD Application must be associated with a project. If not, the AccessRequest
+	// is updated with invalid status.
+	if app.Spec.Project == "" {
+		err := s.updateStatus(ctx, ar, api.InvalidStatus, "Application does not have a project defined", "")
+		if err != nil {
+			return false, fmt.Errorf("error updating status to invalid when app project is not set: %w", err)
+		}
+		return false, nil
+	}
+
+	// If the AccessRequest status is initialized and the target project is different from the
+	// application project, it means that the AccessRequest was created for a different project.
+	// In this case, we need to remove the access from the old project and update the status.
+	if ar.IsInitialized() && ar.Status.TargetProject != app.Spec.Project {
+		logger.Info("Application project changed", "old", ar.Status.TargetProject, "new", app.Spec.Project)
+		oldRole, err := s.getRenderedRole(ctx, ar, ar.Status.TargetProject)
+		if err != nil {
+			return false, fmt.Errorf("error getting rendered RoleTemplate for old project: %w", err)
+		}
+
+		// Only need to remove existing access if the AccessRequest is in a granted state.
+		if ar.Status.RequestState == api.GrantedStatus {
+			err = s.RemoveArgoCDAccess(ctx, ar, oldRole)
+			if err != nil {
+				return false, fmt.Errorf("error removing access for changed target project: %w", err)
+			}
+		}
+		msg := fmt.Sprintf("The application project changed from %s to %s.", ar.Status.TargetProject, app.Spec.Project)
+		err = s.updateStatus(ctx, ar, api.InvalidStatus, msg, RoleTemplateHash(oldRole))
+		if err != nil {
+			return false, fmt.Errorf("error updating access request status after target project change: %w", err)
+		}
+		return false, nil
+	}
+
+	// If the project does not exist, the AccessRequest status is updated to invalid.
+	projName := app.Spec.Project
+	projNamespace := ar.GetNamespace()
+	_, err := s.getProject(ctx, projName, projNamespace)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			msg := fmt.Sprintf("Argo CD Project %s/%s not found", projNamespace, projName)
+			err := s.updateStatus(ctx, ar, api.InvalidStatus, msg, "")
+			if err != nil {
+				return false, fmt.Errorf("error updating status to invalid when project not found: %w", err)
+			}
+			return false, nil
+		}
+		return false, fmt.Errorf("error getting Argo CD Project %s/%s: %w", projNamespace, projName, err)
+	}
+	return true, nil
+}
+
 // handlePermission will analyse the given ar and proceed with granting
 // or removing Argo CD access for the subject listed in the AccessRequest.
 // The following validations will be executed:
@@ -96,13 +162,11 @@ func (s *Service) HandlePermission(ctx context.Context, ar *api.AccessRequest) (
 		return "", fmt.Errorf("error getting Argo CD Application: %w", err)
 	}
 
-	// The Argo CD Application must be associated with a project. If not, the AccessRequest
-	// is updated with invalid status.
-	if app.Spec.Project == "" {
-		err := s.updateStatus(ctx, ar, api.InvalidStatus, "Application does not have a project defined", "")
-		if err != nil {
-			return "", fmt.Errorf("error updating status to invalid: %w", err)
-		}
+	validProject, err := s.ValidateProject(ctx, app, ar)
+	if err != nil {
+		return "", fmt.Errorf("error validating project: %w", err)
+	}
+	if !validProject {
 		return api.InvalidStatus, nil
 	}
 
@@ -121,7 +185,7 @@ func (s *Service) HandlePermission(ctx context.Context, ar *api.AccessRequest) (
 	}
 
 	// initialize the status if not done yet
-	if ar.Status.RequestState == "" {
+	if !ar.IsInitialized() {
 		logger.Debug("Initializing status")
 		ar.Status.TargetProject = app.Spec.Project
 		ar.Status.RoleName = role.AppProjectRoleName(app.GetName(), app.GetNamespace())
@@ -304,10 +368,17 @@ func (s *Service) RemoveArgoCDAccess(ctx context.Context, ar *api.AccessRequest,
 // - error: An error if the synchronization fails, otherwise nil.
 func (s *Service) ensureRoleIsSynced(ctx context.Context, ar *api.AccessRequest, rt *api.RoleTemplate) error {
 	logger := log.FromContext(ctx)
-	logger.Info("Syncing role")
 
 	projName := ar.Status.TargetProject
 	projNamespace := ar.GetNamespace()
+	values := []interface{}{
+		"project.name", projName,
+		"project.namespace", projNamespace,
+		"project.role", rt.AppProjectRoleName(ar.Spec.Application.Name, ar.Spec.Application.Namespace),
+	}
+
+	logger = logger.WithValues(values...)
+	logger.Info("Ensuring role is synced")
 
 	// Retry the synchronization process on conflict errors.
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -317,9 +388,17 @@ func (s *Service) ensureRoleIsSynced(ctx context.Context, ar *api.AccessRequest,
 			return fmt.Errorf("error getting Argo CD Project %s/%s: %w", projNamespace, projName, err)
 		}
 
+		if isRoleInSync(project, ar, rt) {
+			logger.Debug("Project role is already in sync")
+			return nil
+		}
+
 		// Prepare a patch for updating the project policies.
 		patch := client.MergeFromWithOptions(project.DeepCopy(), client.MergeFromWithOptimisticLock{})
 		updateProjectPolicies(project, ar, rt)
+		if ar.Status.RequestState == api.GrantedStatus {
+			addSubjectInRole(project, ar, rt)
+		}
 
 		logger.Debug("Patching AppProject")
 		opts := []client.PatchOption{client.FieldOwner("ephemeral-access-controller")}
@@ -499,6 +578,31 @@ func removeSubjectFromRole(project *argocd.AppProject, ar *api.AccessRequest, rt
 			project.Spec.Roles[idx].Groups = groups
 		}
 	}
+}
+
+// isRoleInSync checks if the given AppProject's role corresponding to the AccessRequest and RoleTemplate
+// is synchronized. It verifies that the role exists, its description matches, the subject is present
+// in the role's groups if the request is granted, and the role's policies and tokens match the template.
+// Returns true if the role is in sync, false otherwise.
+func isRoleInSync(project *argocd.AppProject, ar *api.AccessRequest, rt *api.RoleTemplate) bool {
+	// This variable is used to track if the role was deleted.
+	inSync := false
+	roleName := rt.AppProjectRoleName(ar.Spec.Application.Name, ar.Spec.Application.Namespace)
+	for _, role := range project.Spec.Roles {
+		if role.Name == roleName {
+			if role.Description != rt.Spec.Description {
+				return false
+			}
+			if ar.Status.RequestState == api.GrantedStatus && !slices.Contains(role.Groups, ar.Spec.Subject.Username) {
+				return false
+			}
+			if !MatchRolePoliciesAndTokens(role, rt.Spec.Policies, []argocd.JWTToken{}) {
+				return false
+			}
+			inSync = true
+		}
+	}
+	return inSync
 }
 
 // updateProjectPolicies will update the given project to match all Policies

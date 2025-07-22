@@ -22,22 +22,60 @@ import (
 )
 
 func TestHandlePermission(t *testing.T) {
-	t.Run("will set AccessRequest to invalid if the application project is not set", func(t *testing.T) {
-		// Given
-		updatedAR := &api.AccessRequest{}
-		invalidApp := &argocd.Application{
+	newApp := func(prj string) *argocd.Application {
+		return &argocd.Application{
 			TypeMeta:   metav1.TypeMeta{},
 			ObjectMeta: metav1.ObjectMeta{},
 			Spec: argocd.ApplicationSpec{
-				Project: "",
+				Project: prj,
 			},
 		}
-		clientMock := mocks.NewMockK8sClient(t)
+	}
+	newRoleTemplate := func(spec api.RoleTemplateSpec) *api.RoleTemplate {
+		return &api.RoleTemplate{
+			TypeMeta:   metav1.TypeMeta{},
+			ObjectMeta: metav1.ObjectMeta{},
+			Spec:       spec,
+		}
+	}
+	newProject := func(roles []argocd.ProjectRole) *argocd.AppProject {
+		return &argocd.AppProject{
+			TypeMeta:   metav1.TypeMeta{},
+			ObjectMeta: metav1.ObjectMeta{},
+			Spec: argocd.AppProjectSpec{
+				Roles: roles,
+			},
+		}
+	}
+	setup := func(clientMock *mocks.MockK8sClient, app *argocd.Application, rt *api.RoleTemplate, prj *argocd.AppProject, updatedProj *argocd.AppProject, updatedAR *api.AccessRequest) {
 		clientMock.EXPECT().
 			Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.Application")).
 			RunAndReturn(func(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				app := obj.(*argocd.Application)
-				app.Spec = invalidApp.Spec
+				if app == nil {
+					return apierrors.NewNotFound(schema.GroupResource{Group: "argoproj.io/v1alpha1", Resource: "Application"}, key.Name)
+				}
+				appLocal := obj.(*argocd.Application)
+				appLocal.Spec = app.Spec
+				return nil
+			}).Maybe()
+		clientMock.EXPECT().
+			Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.RoleTemplate")).
+			RunAndReturn(func(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				rtLocal := obj.(*api.RoleTemplate)
+				rtLocal.Spec = rt.DeepCopy().Spec
+				return nil
+			}).Maybe()
+		clientMock.EXPECT().
+			Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.AppProject")).
+			RunAndReturn(func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+				prjLocal := obj.(*argocd.AppProject)
+				prjLocal.Spec = prj.DeepCopy().Spec
+				return nil
+			}).Maybe()
+		clientMock.EXPECT().
+			Patch(mock.Anything, mock.AnythingOfType("*v1alpha1.AppProject"), mock.Anything, mock.Anything).
+			RunAndReturn(func(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				updatedProj.Spec = obj.(*argocd.AppProject).Spec
 				return nil
 			}).Maybe()
 		resourceWriterMock := mocks.NewMockSubResourceWriter(t)
@@ -49,46 +87,25 @@ func TestHandlePermission(t *testing.T) {
 				return nil
 			}).Maybe()
 		clientMock.EXPECT().Status().Return(resourceWriterMock).Maybe()
-		ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "user-to-be-removed")
-		svc := controller.NewService(clientMock, nil, nil)
+	}
 
-		// When
-		status, err := svc.HandlePermission(context.Background(), ar)
-
-		// Then
-		assert.NoError(t, err)
-		assert.NotNil(t, status, "status is nil")
-		assert.Equal(t, api.InvalidStatus, status, "status must be invalid")
-		assert.Equal(t, api.InvalidStatus, updatedAR.Status.RequestState)
-	})
-	t.Run("will handle application not found", func(t *testing.T) {
-		setup := func(clientMock *mocks.MockK8sClient, roleTemplate *api.RoleTemplate, appProj *argocd.AppProject, updatedProj *argocd.AppProject, updatedAR *api.AccessRequest) {
-			gr := schema.GroupResource{
-				Group:    "argoproj.io/v1alpha1",
-				Resource: "Application",
+	t.Run("will validate the project", func(t *testing.T) {
+		t.Run("will invalidate the AccessRequest if the application project is not set", func(t *testing.T) {
+			// Given
+			updatedAR := &api.AccessRequest{}
+			invalidApp := &argocd.Application{
+				TypeMeta:   metav1.TypeMeta{},
+				ObjectMeta: metav1.ObjectMeta{},
+				Spec: argocd.ApplicationSpec{
+					Project: "",
+				},
 			}
-			notFoundErr := apierrors.NewNotFound(gr, "someApp")
+			clientMock := mocks.NewMockK8sClient(t)
 			clientMock.EXPECT().
 				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.Application")).
-				Return(notFoundErr).Maybe()
-			clientMock.EXPECT().
-				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.RoleTemplate")).
 				RunAndReturn(func(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					rt := obj.(*api.RoleTemplate)
-					rt.Spec = roleTemplate.DeepCopy().Spec
-					return nil
-				}).Maybe()
-			clientMock.EXPECT().
-				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.AppProject")).
-				RunAndReturn(func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
-					prj := obj.(*argocd.AppProject)
-					prj.Spec = appProj.DeepCopy().Spec
-					return nil
-				}).Maybe()
-			clientMock.EXPECT().
-				Patch(mock.Anything, mock.AnythingOfType("*v1alpha1.AppProject"), mock.Anything, mock.Anything).
-				RunAndReturn(func(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-					updatedProj.Spec = obj.(*argocd.AppProject).Spec
+					app := obj.(*argocd.Application)
+					app.Spec = invalidApp.Spec
 					return nil
 				}).Maybe()
 			resourceWriterMock := mocks.NewMockSubResourceWriter(t)
@@ -100,8 +117,230 @@ func TestHandlePermission(t *testing.T) {
 					return nil
 				}).Maybe()
 			clientMock.EXPECT().Status().Return(resourceWriterMock).Maybe()
-		}
+			ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "user-to-be-removed")
+			svc := controller.NewService(clientMock, nil, nil)
 
+			// When
+			status, err := svc.HandlePermission(context.Background(), ar)
+
+			// Then
+			assert.NoError(t, err)
+			assert.NotNil(t, status, "status is nil")
+			assert.Equal(t, api.InvalidStatus, status, "status must be invalid")
+			assert.Equal(t, api.InvalidStatus, updatedAR.Status.RequestState)
+		})
+		t.Run("will invalidate the AccessRequest and revoke access when application.spec.project changes", func(t *testing.T) {
+			// Given
+			updatedAR := &api.AccessRequest{}
+			updatedProject := &argocd.AppProject{}
+
+			app := newApp("NEW_PROJECT")
+			rt := newRoleTemplate(api.RoleTemplateSpec{
+				Name:        "some-role-template",
+				Description: "some role description",
+				Policies:    []string{"policy1", "policy2"},
+			})
+			prj := newProject(
+				[]argocd.ProjectRole{
+					{
+						Name:        "ephemeral-some-role-template-someAppNs-someApp",
+						Description: "some role description",
+						Policies:    []string{"policy1", "policy2"},
+						JWTTokens:   []argocd.JWTToken{},
+						Groups:      []string{"some-user", "user-to-be-removed"},
+					},
+				},
+			)
+
+			clientMock := mocks.NewMockK8sClient(t)
+			setup(clientMock, app, rt, prj, updatedProject, updatedAR)
+			ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "user-to-be-removed")
+			ar.Status.TargetProject = "someProject"
+			ar.Status.RequestState = api.GrantedStatus
+			svc := controller.NewService(clientMock, nil, nil)
+
+			// When
+			status, err := svc.HandlePermission(context.Background(), ar)
+
+			// Then
+			assert.NoError(t, err)
+			assert.NotNil(t, status, "status is nil")
+			assert.Equal(t, api.InvalidStatus, status, "status must be invalid")
+			assert.Equal(t, api.InvalidStatus, updatedAR.Status.RequestState)
+			expectedGroups := []string{"some-user"}
+			assert.Equal(t, expectedGroups, updatedProject.Spec.Roles[0].Groups, "groups must be updated")
+		})
+		t.Run("will not remove access if AccessRequest is not granted yet", func(t *testing.T) {
+			// Given
+			updatedAR := &api.AccessRequest{}
+			updatedProject := &argocd.AppProject{}
+
+			app := newApp("NEW_PROJECT")
+			rt := newRoleTemplate(api.RoleTemplateSpec{
+				Name:        "some-role-template",
+				Description: "some role description",
+				Policies:    []string{"policy1", "policy2"},
+			})
+			prj := newProject(
+				[]argocd.ProjectRole{
+					{
+						Name:        "ephemeral-some-role-template-someAppNs-someApp",
+						Description: "some role description",
+						Policies:    []string{"policy1", "policy2"},
+						JWTTokens:   []argocd.JWTToken{},
+						Groups:      []string{"some-user", "another-user"},
+					},
+				},
+			)
+
+			clientMock := mocks.NewMockK8sClient(t)
+			setup(clientMock, app, rt, prj, updatedProject, updatedAR)
+			ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "new-user")
+			ar.Status.TargetProject = "someProject"
+			ar.Status.RequestState = api.RequestedStatus
+			svc := controller.NewService(clientMock, nil, nil)
+
+			// When
+			status, err := svc.HandlePermission(context.Background(), ar)
+
+			// Then
+			assert.NoError(t, err)
+			assert.NotNil(t, status, "status is nil")
+			assert.Equal(t, api.InvalidStatus, status, "status must be invalid")
+			assert.Equal(t, api.InvalidStatus, updatedAR.Status.RequestState)
+			assert.Len(t, updatedProject.Spec.Roles, 0, "project roles must not be changed")
+		})
+		t.Run("will invalidate the AccessRequest if project not found", func(t *testing.T) {
+			// Given
+			updatedAR := &api.AccessRequest{}
+			gr := schema.GroupResource{
+				Group:    "argoproj.io/v1alpha1",
+				Resource: "AppProject",
+			}
+			notFoundError := apierrors.NewNotFound(gr, "Project not found")
+
+			clientMock := mocks.NewMockK8sClient(t)
+			clientMock.EXPECT().
+				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.AppProject")).
+				Return(notFoundError)
+			clientMock.EXPECT().
+				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.Application")).
+				RunAndReturn(func(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					app := obj.(*argocd.Application)
+					app.Spec.Project = "someProject"
+					return nil
+				})
+			resourceWriterMock := mocks.NewMockSubResourceWriter(t)
+			resourceWriterMock.EXPECT().Update(mock.Anything, mock.AnythingOfType("*v1alpha1.AccessRequest")).
+				RunAndReturn(func(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+					ar := obj.(*api.AccessRequest)
+					updatedAR.Spec = ar.Spec
+					updatedAR.Status = ar.Status
+					return nil
+				}).Maybe()
+			clientMock.EXPECT().Status().Return(resourceWriterMock).Maybe()
+			svc := controller.NewService(clientMock, nil, nil)
+			ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "")
+			past := &metav1.Time{
+				Time: time.Now().Add(time.Minute * -1),
+			}
+			ar.Status.ExpiresAt = past
+			ar.Status.TargetProject = "someProject"
+
+			// When
+			status, err := svc.HandlePermission(context.Background(), ar)
+
+			// Then
+			assert.NoError(t, err)
+			assert.NotNil(t, status, "status is nil")
+			assert.Equal(t, api.InvalidStatus, status)
+			assert.Equal(t, api.InvalidStatus, updatedAR.Status.RequestState)
+		})
+		t.Run("will return error if fails to retrieve AppProject", func(t *testing.T) {
+			// Given
+			expectedError := errors.New("error retrieving AppProject")
+			clientMock := mocks.NewMockK8sClient(t)
+			clientMock.EXPECT().
+				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.AppProject")).
+				Return(expectedError)
+			clientMock.EXPECT().
+				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.Application")).
+				RunAndReturn(func(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					app := obj.(*argocd.Application)
+					app.Spec.Project = "someProject"
+					return nil
+				})
+			svc := controller.NewService(clientMock, nil, nil)
+			ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "")
+			past := &metav1.Time{
+				Time: time.Now().Add(time.Minute * -1),
+			}
+			ar.Status.ExpiresAt = past
+			ar.Status.TargetProject = "someProject"
+
+			// When
+			status, err := svc.HandlePermission(context.Background(), ar)
+
+			// Then
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), expectedError.Error())
+			assert.NotNil(t, status, "status is nil")
+			assert.Empty(t, string(status))
+		})
+		t.Run("will add subject back to role if access is granted and revert tampered project changes", func(t *testing.T) {
+			// Given
+			updatedAR := &api.AccessRequest{}
+			updatedProject := &argocd.AppProject{}
+
+			app := newApp("some-project")
+			rt := newRoleTemplate(api.RoleTemplateSpec{
+				Name:        "some-role-template",
+				Description: "some role description",
+				Policies:    []string{"policy1", "policy2"},
+			})
+			prj := newProject(
+				[]argocd.ProjectRole{
+					{
+						Name:        "ephemeral-some-role-template-someAppNs-someApp",
+						Description: "some role description",
+						Policies:    []string{"policy1", "policy2", "tampered-policy"},
+						JWTTokens: []argocd.JWTToken{
+							{
+								IssuedAt:  0,
+								ExpiresAt: 0,
+								ID:        "tampered-token",
+							},
+						},
+						Groups: []string{"some-user"},
+					},
+				},
+			)
+
+			clientMock := mocks.NewMockK8sClient(t)
+			setup(clientMock, app, rt, prj, updatedProject, updatedAR)
+			ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "removed-user")
+			ar.Status.TargetProject = "some-project"
+			ar.Status.RequestState = api.GrantedStatus
+			svc := controller.NewService(clientMock, nil, nil)
+
+			// When
+			status, err := svc.HandlePermission(context.Background(), ar)
+
+			// Then
+			assert.NoError(t, err)
+			assert.NotNil(t, status, "status is nil")
+			assert.Equal(t, api.GrantedStatus, status, "status must be granted")
+			assert.Len(t, updatedProject.Spec.Roles, 1, "project roles must not be changed")
+			assert.Len(t, updatedProject.Spec.Roles[0].Groups, 2, "project role groups must contain the removed user")
+			assert.Contains(t, updatedProject.Spec.Roles[0].Groups, "removed-user", "project role groups must contain the removed user")
+			assert.Len(t, updatedProject.Spec.Roles[0].Policies, 2, "project role policies must be reverted to the original policies")
+			assert.Contains(t, updatedProject.Spec.Roles[0].Policies, "policy1", "project role policies must contain policy1")
+			assert.Contains(t, updatedProject.Spec.Roles[0].Policies, "policy2", "project role policies must contain policy2")
+			assert.Len(t, updatedProject.Spec.Roles[0].JWTTokens, 0, "project role JWTTokens must be empty")
+		})
+	})
+
+	t.Run("will handle application not found", func(t *testing.T) {
 		t.Run("will remove Argo CD permissions successfully", func(t *testing.T) {
 			// Given
 			clientMock := mocks.NewMockK8sClient(t)
@@ -131,7 +370,7 @@ func TestHandlePermission(t *testing.T) {
 			}
 			updatedProject := &argocd.AppProject{}
 			updatedAR := &api.AccessRequest{}
-			setup(clientMock, roleTemplate, currentProj, updatedProject, updatedAR)
+			setup(clientMock, nil, roleTemplate, currentProj, updatedProject, updatedAR)
 
 			svc := controller.NewService(clientMock, nil, nil)
 			ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "user-to-be-removed")
@@ -184,7 +423,7 @@ func TestHandlePermission(t *testing.T) {
 			}
 			updatedProject := &argocd.AppProject{}
 			updatedAR := &api.AccessRequest{}
-			setup(clientMock, roleTemplate, tamperedProj, updatedProject, updatedAR)
+			setup(clientMock, nil, roleTemplate, tamperedProj, updatedProject, updatedAR)
 
 			svc := controller.NewService(clientMock, nil, nil)
 			ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "another-user")
@@ -243,7 +482,7 @@ func TestHandlePermission(t *testing.T) {
 			}
 			updatedProject := &argocd.AppProject{}
 			updatedAR := &api.AccessRequest{}
-			setup(clientMock, roleTemplate, currentProj, updatedProject, updatedAR)
+			setup(clientMock, nil, roleTemplate, currentProj, updatedProject, updatedAR)
 
 			svc := controller.NewService(clientMock, nil, nil)
 			ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "user-to-be-removed")
@@ -258,45 +497,8 @@ func TestHandlePermission(t *testing.T) {
 			assert.Equal(t, api.InvalidStatus, updatedAR.Status.RequestState)
 		})
 	})
+
 	t.Run("will handle access expired", func(t *testing.T) {
-		t.Run("will return error if fails to retrieve AppProject", func(t *testing.T) {
-			// Given
-			expectedError := errors.New("error retrieving AppProject")
-			clientMock := mocks.NewMockK8sClient(t)
-			clientMock.EXPECT().
-				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.AppProject")).
-				Return(expectedError)
-			clientMock.EXPECT().
-				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.Application")).
-				RunAndReturn(func(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					app := obj.(*argocd.Application)
-					app.Spec.Project = "some-project"
-					return nil
-				})
-			clientMock.EXPECT().
-				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.RoleTemplate")).
-				RunAndReturn(func(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					rt := obj.(*api.RoleTemplate)
-					rt.Spec.Name = "some-role"
-					return nil
-				})
-			svc := controller.NewService(clientMock, nil, nil)
-			ar := utils.NewAccessRequest("test", "default", "someApp", "someAppNs", "someRole", "someRoleNs", "")
-			past := &metav1.Time{
-				Time: time.Now().Add(time.Minute * -1),
-			}
-			ar.Status.ExpiresAt = past
-			ar.Status.TargetProject = "someProject"
-
-			// When
-			status, err := svc.HandlePermission(context.Background(), ar)
-
-			// Then
-			assert.Error(t, err)
-			assert.Contains(t, err.Error(), expectedError.Error())
-			assert.NotNil(t, status, "status is nil")
-			assert.Empty(t, string(status))
-		})
 		t.Run("will return error if fails to remove argocd access", func(t *testing.T) {
 			// Given
 			expectedError := errors.New("error updating AppProject")
@@ -306,13 +508,12 @@ func TestHandlePermission(t *testing.T) {
 				RunAndReturn(func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
 					obj = &argocd.AppProject{}
 					return nil
-				}).
-				Once()
+				})
 			clientMock.EXPECT().
 				Get(mock.Anything, mock.Anything, mock.AnythingOfType("*v1alpha1.Application")).
 				RunAndReturn(func(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 					app := obj.(*argocd.Application)
-					app.Spec.Project = "some-project"
+					app.Spec.Project = "someProject"
 					return nil
 				})
 			clientMock.EXPECT().
@@ -346,6 +547,7 @@ func TestHandlePermission(t *testing.T) {
 			assert.Empty(t, string(status))
 		})
 	})
+
 	t.Run("will handle plugins", func(t *testing.T) {
 		t.Run("will update the history with the latest plugin message", func(t *testing.T) {
 			// Given
@@ -369,7 +571,6 @@ func TestHandlePermission(t *testing.T) {
 					rt.Spec.Policies = []string{"some-policy"}
 					return nil
 				})
-
 			pluginMock := mocks.NewMockAccessRequester(t)
 			response1 := &plugin.GrantResponse{
 				Status:  plugin.GrantStatusPending,
@@ -402,8 +603,7 @@ func TestHandlePermission(t *testing.T) {
 				RunAndReturn(func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
 					obj = &argocd.AppProject{}
 					return nil
-				}).
-				Once()
+				})
 			clientMock.EXPECT().
 				Patch(mock.Anything, mock.AnythingOfType("*v1alpha1.AppProject"), mock.Anything, mock.Anything).
 				Return(nil).
