@@ -90,7 +90,7 @@ func TestApiCreateAccessRequest(t *testing.T) {
 			Namespace:            ar.GetNamespace(),
 			ApplicationName:      ar.Spec.Application.Name,
 			ApplicationNamespace: ar.Spec.Application.Namespace,
-			UserId:               ar.Spec.Subject.UserId,
+			UserId:               *ar.Spec.Subject.UserId,
 			Username:             ar.Spec.Subject.Username,
 		}
 		headers := headers(key.Namespace, key.UserId, key.Username, group, key.ApplicationNamespace, key.ApplicationName, projectName)

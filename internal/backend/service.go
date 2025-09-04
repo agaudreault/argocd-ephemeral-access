@@ -259,7 +259,7 @@ func (s *DefaultService) CreateAccessRequest(ctx context.Context, key *AccessReq
 			},
 			Subject: api.Subject{
 				Username: key.Username,
-				UserId:   key.UserId,
+				UserId:   &key.UserId,
 			},
 		},
 	}

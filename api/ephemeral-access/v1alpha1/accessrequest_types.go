@@ -108,7 +108,7 @@ type Subject struct {
 	// Username refers to the entity requesting the elevated permission
 	Username string `json:"username"`
 	// UserId refers to the entity id requesting the elevated permission as authenticated in ArgoCD.
-	UserId string `json:"userId"`
+	UserId *string `json:"userId"`
 }
 
 // AccessRequestStatus defines the observed state of AccessRequest

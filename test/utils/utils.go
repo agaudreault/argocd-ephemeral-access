@@ -329,7 +329,7 @@ func newAccessRequest() *api.AccessRequest {
 			},
 			Subject: api.Subject{
 				Username: "my@user.com",
-				UserId:   "my-user-id",
+				UserId:   ptr.To("my-user-id"),
 			},
 		},
 	}
